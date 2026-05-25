@@ -20,7 +20,7 @@ for differential expression analysis:
 ## Repository structure
 
 ```
-IEO_RNAseq_CLL_MultiPipeline/
+CLL_RNAseq_MultiplePipeline/
 ├── data/                          # Raw data (git-ignored, see setup below)
 │   ├── .gitignore
 │   ├── GSE151159.rds              # SummarizedExperiment with counts + metadata
@@ -39,7 +39,7 @@ IEO_RNAseq_CLL_MultiPipeline/
 ├── 00_export_shared_data.R        # Run ONCE to extract CSVs from RDS
 ├── IEO_RNAseq_CLL.Rproj           # R project file
 ├── environment.yml                # Conda env for Pipeline 3
-├── renv.lock                      # R package versions (after renv::init())
+├── renv.lock                      
 ├── .gitignore
 └── README.md
 ```
@@ -48,13 +48,12 @@ IEO_RNAseq_CLL_MultiPipeline/
 
 ### 1. Clone the repository
 ```bash
-git clone https://github.com/YOUR_USERNAME/IEO_RNAseq_CLL_MultiPipeline.git
+git clone https://github.com/Sam-E18/CLL_RNAseq_MultiplePipeline.git
 cd IEO_RNAseq_CLL_MultiPipeline
 ```
 
 ### 2. Get the data
-Place `GSE151159.rds` in the `data/` directory. This file is available from 
-the IEOproject R package or can be downloaded from GEO accession GSE151159.
+Place `GSE151159.rds` in the `data/` directory. This file is available and can be downloaded from GEO accession GSE151159.
 
 ### 3. Set up the R environment (Pipelines 1 & 2)
 ```r
@@ -125,8 +124,7 @@ jupyter lab scripts/03_scanpy_pydeseq2.ipynb
 
 ## Course resources
 
-This project was developed as part of the IEO Transcriptomics course at UPF:
-- [IEO Course Materials](https://functionalgenomics.upf.edu/courses/IEO/)
+This project was developed as part of the IEO Transcriptomics course at UPF with some personal changes:
 - [DESeq2 Vignette](https://www.bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html)
 - [edgeR User Guide](https://bioconductor.org/packages/release/bioc/vignettes/edgeR/inst/doc/edgeRUsersGuide.pdf)
 - [Seurat Tutorials](https://satijalab.org/seurat/articles/get_started.html)
