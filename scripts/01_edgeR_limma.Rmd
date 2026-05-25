@@ -72,11 +72,11 @@ The `SummarizedExperiment` class from Bioconductor is designed to store
 rectangular matrices of experimental results (e.g., count matrices from
 RNA-seq). It keeps three critical pieces of information tightly coupled:
 
-- `assays()` — one or more matrices (e.g., raw counts, logCPM, normalized
+- `assays()` - one or more matrices (e.g., raw counts, logCPM, normalized
   values), where rows are genomic features (genes) and columns are samples
-- `rowData()` — a DataFrame of gene-level annotations (Ensembl ID,
+- `rowData()` - a DataFrame of gene-level annotations (Ensembl ID,
   biotype, gene symbol)
-- `colData()` — a DataFrame of sample-level metadata (treatment condition,
+- `colData()` - a DataFrame of sample-level metadata (treatment condition,
   batch, clinical covariates)
 
 This coupling ensures that whenever we subset genes or samples, all three
@@ -241,10 +241,10 @@ cat("Exported shared CSVs to data/ for Pipelines 2 and 3\n")
 The `DGEList` from edgeR is the workhorse container for differential
 expression analysis in the edgeR/limma ecosystem. It wraps together:
 
-- `$counts` — the raw count matrix (genes × samples)
-- `$samples` — sample-level information including library sizes and
+- `$counts` - the raw count matrix (genes × samples)
+- `$samples` - sample-level information including library sizes and
   normalization factors
-- `$genes` — gene-level annotations
+- `$genes` - gene-level annotations
 
 Unlike the `SummarizedExperiment`, which is a general-purpose genomic
 data container, the `DGEList` is specifically designed for count-based
@@ -266,7 +266,7 @@ cat("Library size range:", round(range(dge$samples$lib.size) / 1e6, 1), "million
 ## Sequencing Depth
 
 We visualize sequencing depth across all samples. An even distribution
-is desirable — large imbalances could indicate technical issues that
+is desirable - large imbalances could indicate technical issues that
 normalization may not fully correct.
 
 ```{r sequencing-depth, fig.cap="Barplot of sequencing depth (millions of reads) per sample, ordered by library size. Colors indicate dasatinib response status."}
@@ -339,11 +339,11 @@ expressed at a biologically meaningful level in enough samples.
 
 **Two filtering strategies compared:**
 
-1. `filterByExpr()` (edgeR built-in) — uses the design matrix to
+1. `filterByExpr()` (edgeR built-in) - uses the design matrix to
    determine the minimum count threshold automatically. It requires a
    gene to have at least ~10 counts in the smallest group.
 
-2. **Manual CPM threshold** — we require CPM > cutoff in at least
+2. **Manual CPM threshold** - we require CPM > cutoff in at least
    *n* samples, where *n* equals the size of the smallest group. The
    cutoff adapts to library size: `10 / min(lib.size/1e6)`.
 
@@ -395,7 +395,7 @@ legend("topright", c("All genes", "Retained genes"),
 
 Raw library sizes differ between samples due to sequencing depth
 variation. But simply dividing by total counts (CPM) doesn't account
-for **RNA composition bias** — the situation where a few highly expressed
+for **RNA composition bias** - the situation where a few highly expressed
 genes in one sample consume a disproportionate share of the sequencing
 reads, making all other genes appear relatively under-expressed.
 
@@ -466,7 +466,7 @@ par(mfrow = c(1, 1))
 
 MDS (Multidimensional Scaling) reduces high-dimensional gene expression
 data into 2D by preserving the distances between samples. In edgeR,
-`plotMDS()` uses **leading log-fold change** distances — the root mean
+`plotMDS()` uses **leading log-fold change** distances - the root mean
 square of the largest log-fold changes between each pair of samples.
 This makes it more robust than PCA for count data because it focuses on
 the genes that most differ between samples rather than the highest-
@@ -638,7 +638,7 @@ this assumption.
 3. Computing the residuals and estimating the variance at each expression
    level (the **mean-variance trend**)
 4. Generating **precision weights** for each observation based on this
-   trend — observations with higher predicted variance get lower weight
+   trend - observations with higher predicted variance get lower weight
 
 The output is an `EList` object with `$E` (log₂-CPM), `$weights`
 (precision weights), and `$design` (design matrix). This weighted data
@@ -660,7 +660,7 @@ v <- voom(dge.filt, design, plot = TRUE)
 design matrix and precision weights from voom. Each gene gets its own
 set of coefficients (one per design column) and residual variance.
 
-`eBayes()` then applies **empirical Bayes moderation** — it "borrows
+`eBayes()` then applies **empirical Bayes moderation** - it "borrows
 strength" across genes by shrinking each gene's variance estimate toward
 a common prior. This is critical because with only ~12-16 samples per
 group, individual gene variance estimates are noisy. By pooling
@@ -874,7 +874,7 @@ the hierarchical structure of GO by conditioning on child terms that
 have already been found significant, reducing redundancy.
 
 ```{r go-enrichment}
-# GOstats requires Entrez IDs — our gene identifiers are Ensembl
+# GOstats requires Entrez IDs - our gene identifiers are Ensembl
 # We use the strict DEGs Ensembl IDs
 params <- new("GOHyperGParams",
               geneIds     = strict_DEGs$ensembl_id,
