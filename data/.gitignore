@@ -1,0 +1,10 @@
+# Large data files - do NOT track in Git
+*.rds
+*.csv
+*.tsv
+*.h5ad
+*.h5
+*.gz
+*.bam
+*.fastq
+!.gitignore

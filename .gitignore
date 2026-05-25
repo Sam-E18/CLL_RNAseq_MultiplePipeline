@@ -1,0 +1,25 @@
+# R
+.Rhistory
+.Rdata
+.RData
+.Ruserdata
+*.Rproj.user/
+renv/library/
+renv/staging/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+
+# Results (track selectively)
+results/plots/*.png
+results/plots/*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environments
+.conda/
