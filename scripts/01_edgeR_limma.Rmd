@@ -1,5 +1,5 @@
 ---
-title: "Pipeline 1: Bulk RNA-seq Analysis of CLL Dasatinib Response"
+title: "Bulk RNA-seq Analysis of CLL Dasatinib Response"
 subtitle: "SummarizedExperiment + edgeR/limma-voom Approach"
 author:
 - name: "Samuel Escudero, Ivon Sanchez, Karim Hamed"
@@ -114,7 +114,7 @@ library(sva)                  # Surrogate Variable Analysis
 library(GOstats)              # Hypergeometric GO testing
 library(org.Hs.eg.db)         # Human gene annotation database
 library(AnnotationDbi)        # Interface to annotation resources
-library(fgsea)                # Fast Gene Set Enrichment Analysis
+#library(fgsea)                # Fast Gene Set Enrichment Analysis
 
 # --- Visualization and reporting ---
 library(pheatmap)             # Heatmaps with clustering
@@ -844,12 +844,12 @@ kable(top20_table,
 
 ```{r save-results}
 # Save full results
-write.csv(tt, "../results/tables/p1_full_DE_results.csv", row.names = TRUE)
+#write.csv(tt, "../results/tables/p1_full_DE_results.csv", row.names = TRUE)
 
 # Save strict DEGs
-write.csv(strict_DEGs, "../results/tables/p1_strict_DEGs.csv", row.names = FALSE)
+#write.csv(strict_DEGs, "../results/tables/p1_strict_DEGs.csv", row.names = FALSE)
 
-cat("Saved full DE results and strict DEGs to results/tables/\n")
+#cat("Saved full DE results and strict DEGs to results/tables/\n")
 ```
 
 # Functional Enrichment Analysis
@@ -965,9 +965,9 @@ cat("Bottom 5:", tail(names(gene_ranks)), "\n")
 
 ```{r save-enrichment}
 # Save GO results
-write.csv(go_results, "../results/enrichment/p1_GO_BP_results.csv",
-          row.names = FALSE)
-cat("Saved enrichment results to results/enrichment/\n")
+#write.csv(go_results, "../results/enrichment/p1_GO_BP_results.csv",
+#          row.names = FALSE)
+#cat("Saved enrichment results to results/enrichment/\n")
 ```
 
 # Discussion
