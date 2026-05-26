@@ -1,10 +1,13 @@
-# ============================================
+# =============================================================
 # Conda environment for Pipeline 3: Scanpy + pyDESeq2 + diffxpy
-# 
+#
 # Usage:
 #   conda env create -f environment.yml
 #   conda activate ieo_rnaseq
-# ============================================
+#
+# To update after changes:
+#   conda env update -f environment.yml --prune
+# =============================================================
 name: ieo_rnaseq
 channels:
   - conda-forge
@@ -24,6 +27,7 @@ dependencies:
   - umap-learn
   - jupyter
   - jupyterlab
+  - ipykernel
   - pip
   - pip:
     - pydeseq2>=0.4
