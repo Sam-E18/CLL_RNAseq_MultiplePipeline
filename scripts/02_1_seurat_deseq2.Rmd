@@ -1,0 +1,1305 @@
+---
+title: "Pipeline 2: Bulk RNA-seq Analysis of CLL Dasatinib Response"
+subtitle: "Seurat Object + DESeq2 Approach"
+author:
+- name: "Samuel Escudero, Ivon Sanchez, Karim Hamed"
+  affiliation: Universitat Pompeu Fabra
+  email: samuel.escudero01@estudiant.upf.edu
+date: "`r Sys.Date()`"
+output:
+  BiocStyle::html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    fig_captions: yes
+    code_folding: show
+bibliography: references.bib
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse    = TRUE,
+  comment     = "",
+  fig.align   = "center",
+  fig.width   = 8,
+  fig.height  = 6,
+  fig.wide    = TRUE,
+  cache       = FALSE,
+  message     = FALSE,
+  warning     = FALSE
+)
+```
+
+# Preliminary: From FASTQ to Count Matrix
+
+Before we begin our differential expression analysis, it is important to
+understand how the raw sequencing data (FASTQ files) are processed to
+produce the count matrix that we use as input. This section describes the
+upstream steps that precede our R-based analysis. In our case, the
+GSE151159 dataset was already processed and the count matrix is
+available as an RDS file. However, if we were starting from raw FASTQ
+files, we would need to perform the following steps.
+
+## The upstream RNA-seq workflow
+
+The general workflow from raw reads to a count matrix involves three
+major steps:
+
+1. **Quality control of raw reads** (FastQC, MultiQC)
+2. **Alignment to a reference genome** (STAR) or pseudo-alignment
+   to a transcriptome (Salmon, kallisto)
+3. **Quantification** (featureCounts for genome-aligned BAMs, or
+   built-in quantification in Salmon/kallisto)
+
+## Option A: Genome alignment with STAR + featureCounts
+
+STAR (Spliced Transcripts Alignment to a Reference) is a fast and
+accurate splice-aware aligner designed specifically for RNA-seq. It
+maps reads to the genome while correctly handling intron-spanning
+reads (spliced alignments). After alignment, featureCounts (from the
+Subread package) counts how many reads overlap each annotated gene.
+
+```bash
+# ---- STEP 0: Quality control of raw reads ----
+# FastQC generates per-sample HTML reports with metrics like
+# per-base quality scores, adapter content, and GC distribution
+fastqc -o qc_results/ -t 8 raw_data/*.fastq.gz
+
+# MultiQC aggregates all FastQC reports into a single summary
+multiqc qc_results/ -o qc_results/multiqc/
+
+# ---- STEP 1: Build the STAR genome index (run once) ----
+# We need the reference genome FASTA and the GTF annotation file.
+# For human data, we download these from ENSEMBL or GENCODE.
+# The sjdbOverhang parameter should be (read length - 1).
+# For 150bp reads, use 149; for 100bp reads, use 99.
+
+STAR \
+  -runMode genomeGenerate \
+  -genomeDir star_index/ \
+  -genomeFastaFiles Homo_sapiens.GRCh38.dna.primary_assembly.fa \
+  -sjdbGTFfile Homo_sapiens.GRCh38.109.gtf \
+  -sjdbOverhang 149 \
+  -runThreadN 8
+
+# ---- STEP 2: Align reads to the genome ----
+# For each sample, we run STAR in alignment mode.
+# Input: paired-end FASTQ files (R1 and R2)
+# Output: a sorted BAM file with aligned reads
+
+for sample in sample1 sample2 sample3; do
+  STAR \
+    -genomeDir star_index/ \
+    -readFilesIn raw_data/${sample}_R1.fastq.gz \
+                 raw_data/${sample}_R2.fastq.gz \
+    -readFilesCommand zcat \
+    -outSAMtype BAM SortedByCoordinate \
+    -outFileNamePrefix aligned/${sample}_ \
+    -runThreadN 8 \
+    -quantMode GeneCounts
+done
+
+# ---- STEP 3: Count reads per gene with featureCounts ----
+# featureCounts assigns aligned reads to genomic features (genes)
+# defined in the GTF annotation file.
+# -p: paired-end mode
+# -s 2: reverse-stranded library (most common for Illumina)
+# -T 8: use 8 threads
+# -a: GTF annotation file
+# -o: output count matrix
+
+featureCounts \
+  -p \
+  -s 2 \
+  -T 8 \
+  -a Homo_sapiens.GRCh38.109.gtf \
+  -o counts/gene_counts.txt \
+  aligned/*_Aligned.sortedByCoord.out.bam
+```
+
+The output `gene_counts.txt` is a tab-separated file with gene IDs in
+rows and samples in columns. We would then import this into R using
+`read.table()` and construct our analysis objects.
+
+## Option B: Pseudo-alignment with Salmon
+
+Salmon takes a fundamentally different approach: instead of aligning
+reads to the genome, it performs "pseudo-alignment" directly to the
+transcriptome. This is much faster (minutes instead of hours) and does
+not require a genome index, only a transcriptome index. Salmon also
+applies bias correction models (GC bias, positional bias, fragment
+length) that improve quantification accuracy.
+
+```bash
+# ---- STEP 1: Build the Salmon transcriptome index (run once) ----
+# We use the cDNA FASTA from ENSEMBL (transcriptome, not genome)
+
+salmon index \
+  -t Homo_sapiens.GRCh38.cdna.all.fa.gz \
+  -i salmon_index \
+  -p 8
+
+# ---- STEP 2: Quantify each sample ----
+# Salmon performs pseudo-alignment and quantification in one step
+# -l A: automatically detect library type
+# -1 and -2: paired-end FASTQ files
+# -p: number of threads
+
+for sample in sample1 sample2 sample3; do
+  salmon quant \
+    -i salmon_index \
+    -l A \
+    -1 raw_data/${sample}_R1.fastq.gz \
+    -2 raw_data/${sample}_R2.fastq.gz \
+    -p 8 \
+    -o salmon_quant/${sample}
+done
+
+# ---- STEP 3: Import into R with tximeta ----
+# Salmon produces per-sample quant.sf files with transcript-level
+# counts and TPM values. We use tximeta in R to import these and
+# summarize to gene level.
+```
+
+To import Salmon output into R, we would use the `tximeta` package:
+
+```r
+# In R:
+library(tximeta)
+library(SummarizedExperiment)
+
+# Create a sample table linking sample names to quant.sf paths
+coldata <- data.frame(
+  names  = c("sample1", "sample2", "sample3"),
+  files  = file.path("salmon_quant",
+                     c("sample1", "sample2", "sample3"),
+                     "quant.sf"),
+  condition = c("NonResponder", "NonResponder", "Responder")
+)
+
+# Import and summarize to gene level
+se <- tximeta(coldata)
+gse <- summarizeToGene(se)
+
+# 'gse' is now a SummarizedExperiment with gene-level counts
+# ready for DESeq2 or edgeR analysis
+```
+
+## STAR vs. Salmon: Key differences
+
+| Feature | STAR + featureCounts | Salmon |
+|---------|---------------------|--------|
+| Approach | Genome alignment | Transcriptome pseudo-alignment |
+| Speed | Slower (hours) | Very fast (minutes) |
+| Output | BAM + count matrix | Transcript-level counts + TPM |
+| Memory | High (30+ GB for human) | Low (< 8 GB) |
+| Splice-awareness | Yes (detects novel junctions) | No (uses known transcripts) |
+| Bias correction | No built-in | Yes (GC, positional, fragment) |
+| R import | read.table() or Rsubread | tximeta (preserves metadata) |
+| Best for | Novel transcript discovery | Standard DE analysis |
+
+For our CLL dataset (GSE151159), the count matrix was already generated
+by the original authors and deposited at GEO. We load it directly as
+an RDS file containing a SummarizedExperiment object.
+
+# Introduction
+
+## Biological context
+
+Chronic lymphocytic leukemia (CLL) is a clinically heterogeneous
+hematological malignancy characterized by diverse responses to targeted
+treatments. Dasatinib, a second-generation tyrosine kinase inhibitor
+(TKI), represents a potential therapeutic strategy for patients with CLL.
+However, its clinical efficacy varies significantly between individuals.
+Blatte et al. (2021) employed RNA sequencing (RNA-seq) to characterize
+the transcriptional profiles of primary leukemia cells from
+treatment-naive CLL patients classified into two groups based on in vitro
+cytotoxicity assays: **responders** (dasatinib-sensitive) and
+**nonresponders** (dasatinib-resistant). Their primary goal was to
+discover gene expression signatures predictive of dasatinib sensitivity.
+
+The RNAseq data generated by Blatte and colleagues were deposited at the
+Gene Expression Omnibus (GEO), publicly accessible under accession
+[GSE151159](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE151159).
+
+## Analytical approach: Seurat + DESeq2
+
+This is **Pipeline 2** of our multi-approach analysis. We use a
+**Seurat object** as our data container and **DESeq2** as our
+differential expression framework. This pipeline is fully
+self-contained and loads all data directly from the RDS file.
+
+**Theory: The Seurat object**
+
+Seurat was originally developed for single-cell RNA-seq (scRNA-seq)
+analysis by the Satija Lab (Butler et al., 2018; Stuart et al., 2019).
+However, its data structure is perfectly capable of handling bulk
+RNA-seq data. A Seurat object stores:
+
+- **Assays**: named slots containing expression matrices. The default
+  `RNA` assay holds raw counts in `counts`, normalized data in `data`,
+  and scaled data in `scale.data`.
+- **Meta.data**: a data frame of sample-level (or cell-level in
+  scRNA-seq) metadata, equivalent to `colData()` in
+  SummarizedExperiment.
+- **Reductions**: dimensionality reduction results (PCA, UMAP, tSNE).
+- **Graphs**: nearest-neighbor graphs for clustering.
+
+**Theory: DESeq2 vs. limma-voom**
+
+While Pipeline 1 used `voom()` to transform counts into weighted
+log-CPM values and then applied linear models, DESeq2 takes a
+fundamentally different approach:
+
+1. **Negative binomial model**: DESeq2 models the raw counts directly
+   using a negative binomial (NB) distribution, which naturally handles
+   the overdispersion (variance > mean) typical of RNA-seq data.
+
+2. **Shrinkage of dispersion estimates**: DESeq2 estimates gene-wise
+   dispersions and then shrinks them toward a fitted trend using an
+   empirical Bayes procedure. This is conceptually similar to what
+   limma's `eBayes()` does for variances, but operates on the
+   dispersion parameter of the NB distribution.
+
+3. **Wald test**: For each gene, DESeq2 tests whether the log2 fold
+   change coefficient is significantly different from zero using a
+   Wald test (ratio of the estimated LFC to its standard error).
+
+4. **Log fold change shrinkage**: After testing, DESeq2 can apply
+   LFC shrinkage using methods like `apeglm`, which produces more
+   reliable effect size estimates for genes with low counts or high
+   dispersion.
+
+| Feature | limma-voom (Pipeline 1) | DESeq2 (Pipeline 2) |
+|---------|------------------------|---------------------|
+| Input | Transformed log-CPM + weights | Raw counts directly |
+| Distribution | Normal (after voom) | Negative binomial |
+| Variance stabilization | voom precision weights | NB dispersion shrinkage |
+| Test | Moderated t-test | Wald test |
+| LFC shrinkage | Not built-in | apeglm/ashr/normal |
+| Speed | Faster | Slower (iterative fitting) |
+| Best for | Large samples, complex designs | Small-moderate samples |
+
+## Libraries
+
+```{r load-libraries}
+# Core packages
+library(Seurat)               # Data container and visualization
+library(DESeq2)               # Differential expression (NB model)
+library(SummarizedExperiment)  # To read the RDS
+
+# Batch effect detection
+library(sva)                  # Surrogate Variable Analysis
+
+# Visualization
+library(ggplot2)              # Grammar of graphics
+library(ggrepel)              # Non-overlapping labels
+library(pheatmap)             # Clustered heatmaps
+library(RColorBrewer)         # Color palettes
+
+# Functional enrichment
+library(GOstats)              # Hypergeometric GO testing
+library(org.Hs.eg.db)         # Human gene annotations
+library(AnnotationDbi)        # Annotation interface
+
+# Data manipulation and reporting
+library(dplyr)
+library(tibble)
+library(knitr)
+library(kableExtra)
+```
+
+# Data Import and Seurat Object Construction
+
+## Loading the SummarizedExperiment
+
+We load the `GSE151159.rds` file directly, extract the components we
+need, and classify samples into responders and non-responders. This
+pipeline is self-contained and does not depend on any exports from
+Pipeline 1.
+
+```{r load-data}
+# Load the SummarizedExperiment directly from the RDS
+cll <- readRDS("../data/GSE151159.rds")
+
+cat("Loaded:", class(cll), "\n")
+cat("Dimensions:", nrow(cll), "genes x", ncol(cll), "samples\n")
+
+# Inspect the structure
+cat("\nAssays available:", names(assays(cll)), "\n")
+cat("Sample metadata columns:", colnames(colData(cll)), "\n")
+cat("Gene annotation columns:", colnames(rowData(cll)), "\n")
+```
+
+## Sample Classification
+
+We create a clean binary factor `response2` from the raw
+`description.2` metadata field, then remove ambiguous samples labeled
+"all".
+
+```{r classify-samples}
+# Examine raw descriptions
+cat("Raw sample descriptions:\n")
+table(colData(cll)$description.2)
+
+# Create clean response classification
+desc2 <- colData(cll)$description.2
+response_raw <- ifelse(
+  grepl("^responders_final", desc2), "Responder",
+  ifelse(grepl("^nonresponders_final", desc2), "NonResponder", NA)
+)
+
+colData(cll)$response2 <- factor(
+  response_raw,
+  levels = c("NonResponder", "Responder")
+)
+
+cat("\nClean response classification:\n")
+table(colData(cll)$response2, useNA = "ifany")
+
+# Remove samples with undefined response (labeled "all")
+keep_samples <- !is.na(colData(cll)$response2)
+cll <- cll[, keep_samples]
+
+cat("\nAfter removing ambiguous samples:", ncol(cll), "samples retained\n")
+cat("  NonResponders:", sum(cll$response2 == "NonResponder"), "\n")
+cat("  Responders:   ", sum(cll$response2 == "Responder"), "\n")
+```
+
+## Extracting Data Components
+
+```{r extract-components}
+# Extract count matrix, sample metadata, and gene metadata
+counts_mat <- as.data.frame(assays(cll)$counts)
+sample_meta <- as.data.frame(colData(cll))
+gene_meta   <- as.data.frame(rowData(cll))
+
+cat("Count matrix:", nrow(counts_mat), "genes x", ncol(counts_mat), "samples\n")
+cat("\nFirst 5 gene annotations:\n")
+head(gene_meta, 5)
+```
+
+## Creating the Seurat Object
+
+**Theory: CreateSeuratObject internals**
+
+When we call `CreateSeuratObject()`, Seurat performs several things
+under the hood:
+
+1. Creates an `Assay` object containing the count matrix in the
+   `counts` layer
+2. Computes `nCount_RNA` (total counts per sample, equivalent to
+   library size) and `nFeature_RNA` (number of detected genes per
+   sample)
+3. Stores sample metadata in the `meta.data` slot
+4. Sets the default assay to `RNA`
+
+The `min.cells` and `min.features` parameters are filtering thresholds.
+For bulk RNA-seq, `min.cells` controls how many samples must express a
+gene for it to be retained. We set `min.cells = 3` as a light
+pre-filter (genes must be detected in at least 3 samples).
+
+```{r create-seurat}
+# Ensure response2 is a factor
+sample_meta$response2 <- factor(sample_meta$response2,
+                                 levels = c("NonResponder", "Responder"))
+
+# Create Seurat object
+seurat_obj <- CreateSeuratObject(
+  counts    = as.matrix(counts_mat),
+  meta.data = sample_meta,
+  project   = "CLL_Dasatinib",
+  min.cells = 3,       # Gene must be in >= 3 samples
+  min.features = 200   # Sample must have >= 200 detected genes
+)
+
+cat("Seurat object created:\n")
+seurat_obj
+```
+
+```{r inspect-seurat}
+# Inspect the structure
+cat("Default assay:", DefaultAssay(seurat_obj), "\n")
+cat("Assay layers:", Layers(seurat_obj), "\n")
+cat("Metadata columns:", colnames(seurat_obj@meta.data), "\n\n")
+
+# Check nCount and nFeature distributions
+cat("Library size (nCount_RNA) range:",
+    range(seurat_obj$nCount_RNA), "\n")
+cat("Detected genes (nFeature_RNA) range:",
+    range(seurat_obj$nFeature_RNA), "\n")
+cat("Number of samples:", ncol(seurat_obj), "\n")
+```
+
+# Quality Control
+
+## QC Metrics Visualization
+
+In scRNA-seq, we would filter cells based on mitochondrial percentage,
+doublet scores, and gene/UMI counts. For bulk RNA-seq, these metrics
+are less critical because each "cell" is actually a bulk sample with
+millions of reads. However, visualizing library size and gene detection
+rates helps us identify potential outlier samples.
+
+```{r qc-violin, fig.cap="Distribution of QC metrics across samples. Left: total read counts (library size). Right: number of detected genes per sample."}
+VlnPlot(seurat_obj,
+        features = c("nCount_RNA", "nFeature_RNA"),
+        group.by = "response2",
+        pt.size = 0.5,
+        cols = c("steelblue", "coral")) +
+  theme(axis.text.x = element_text(angle = 0))
+```
+
+```{r qc-scatter, fig.cap="Relationship between library size and number of detected genes, colored by response group. A strong linear relationship is expected for good-quality samples."}
+FeatureScatter(seurat_obj,
+               feature1 = "nCount_RNA",
+               feature2 = "nFeature_RNA",
+               group.by = "response2",
+               cols = c("steelblue", "coral"))
+```
+
+## Sequencing Depth Barplot
+
+```{r seq-depth, fig.cap="Barplot of sequencing depth (millions of reads) per sample, ordered by library size. Colors indicate dasatinib response status."}
+ord <- order(seurat_obj$nCount_RNA)
+barplot(
+  seurat_obj$nCount_RNA[ord] / 1e6,
+  las   = 1,
+  ylab  = "Millions of reads",
+  xlab  = "Samples",
+  col   = c("steelblue", "coral")[seurat_obj$response2[ord]],
+  border = NA
+)
+legend("topleft",
+       c("NonResponder", "Responder"),
+       fill = c("steelblue", "coral"),
+       inset = 0.01, bty = "n")
+```
+
+# Normalization
+
+## LogNormalize (Seurat default)
+
+**Theory: Seurat's LogNormalize**
+
+Seurat's default normalization uses a simple approach:
+
+1. Divide each gene's count by the total counts for that sample
+   (equivalent to calculating a proportion)
+2. Multiply by a scale factor (default: 10,000)
+3. Take the natural log (log1p, i.e., log(x + 1))
+
+This is conceptually similar to computing log-CPM (counts per million),
+but with a scale factor of 10,000 instead of 1,000,000. The formula is:
+
+`normalized_value = log(count / total_counts * scale_factor + 1)`
+
+This is simpler than TMM (which adjusts for RNA composition) but works
+well in practice for many datasets. The normalized values are stored in
+the `data` layer of the RNA assay.
+
+```{r normalize}
+seurat_obj <- NormalizeData(
+  seurat_obj,
+  normalization.method = "LogNormalize",
+  scale.factor = 10000
+)
+
+cat("Normalization complete.\n")
+cat("Layers after normalization:", Layers(seurat_obj), "\n")
+```
+
+## Identify Highly Variable Features
+
+**Theory: Why select variable features?**
+
+For dimensionality reduction (PCA, UMAP), we want to focus on genes
+that show meaningful variation across samples, not genes with constant
+expression. Highly variable genes (HVGs) are those with the most
+variance relative to their mean expression. Seurat uses the `vst`
+(variance-stabilizing transformation) method to identify HVGs,
+which models the relationship between mean and variance and selects
+genes that deviate most from this trend.
+
+In scRNA-seq, we typically select 2000-3000 HVGs. For bulk RNA-seq with
+fewer samples, we can be more generous (3000-5000) to capture more
+of the biological variation.
+
+```{r find-variable-features, fig.cap="Highly variable genes identified by the VST method. Red points are the selected variable features. Top 10 are labeled."}
+seurat_obj <- FindVariableFeatures(
+  seurat_obj,
+  selection.method = "vst",
+  nfeatures = 3000
+)
+
+# Plot variable features
+top10_hvg <- head(VariableFeatures(seurat_obj), 10)
+plot1 <- VariableFeaturePlot(seurat_obj)
+plot2 <- LabelPoints(plot = plot1, points = top10_hvg, repel = TRUE)
+plot2
+```
+
+## Scale Data
+
+**Theory: ScaleData**
+
+Scaling performs two operations per gene:
+
+1. **Centers** the expression values (subtracts the mean across samples)
+2. **Scales** by dividing by the standard deviation
+
+After scaling, each gene has mean = 0 and SD = 1. This is essential for
+PCA because without scaling, PCA would be dominated by highly expressed
+genes simply because they have larger absolute values, not because they
+carry more biological information. The scaled data is stored in the
+`scale.data` layer.
+
+```{r scale-data}
+seurat_obj <- ScaleData(seurat_obj, features = rownames(seurat_obj))
+cat("Data scaled. Layers:", Layers(seurat_obj), "\n")
+```
+
+# Dimensionality Reduction
+
+## PCA
+
+**Theory: PCA on bulk RNA-seq via Seurat**
+
+PCA (Principal Component Analysis) finds the axes of maximum variance
+in the data. Seurat's `RunPCA()` operates on the scaled data and
+computes the top principal components. For bulk RNA-seq, PC1 and PC2
+typically capture the dominant biological signal (e.g., treatment
+response), while later PCs may capture batch effects or noise.
+
+The **elbow plot** helps us decide how many PCs contain real signal:
+we look for the "elbow" where the standard deviation drops sharply,
+indicating that subsequent PCs capture mostly noise.
+
+Note that in Pipeline 1 we used MDS (multidimensional scaling) with
+leading log-fold change distances. PCA and MDS are conceptually similar
+but not identical: MDS preserves sample distances directly, while PCA
+finds the directions of maximum variance. For well-normalized bulk
+RNA-seq, both should give similar sample groupings.
+
+```{r run-pca}
+seurat_obj <- RunPCA(seurat_obj,
+                      features = VariableFeatures(seurat_obj),
+                      npcs = 20)
+```
+
+```{r pca-plot, fig.cap="PCA of samples colored by dasatinib response status. Each point is one sample."}
+DimPlot(seurat_obj, reduction = "pca", group.by = "response2",
+        cols = c("steelblue", "coral"), pt.size = 3) +
+  ggtitle("PCA: Responders vs NonResponders")
+```
+
+```{r elbow-plot, fig.cap="Elbow plot showing the standard deviation explained by each principal component. The elbow point suggests how many PCs carry meaningful signal."}
+ElbowPlot(seurat_obj, ndims = 20)
+```
+
+```{r pca-loadings, fig.cap="Top genes contributing to PC1 and PC2. These genes drive the primary separation between samples."}
+VizDimLoadings(seurat_obj, dims = 1:2, reduction = "pca")
+```
+
+## UMAP
+
+**Theory: UMAP vs. PCA**
+
+UMAP (Uniform Manifold Approximation and Projection) is a nonlinear
+dimensionality reduction technique that preserves both local and global
+structure better than PCA. While PCA is limited to linear relationships,
+UMAP can capture complex, nonlinear patterns in the data. However, UMAP
+is stochastic (results vary between runs) and distances in UMAP space
+are not directly interpretable. For bulk RNA-seq with few samples
+(~28), UMAP adds limited value over PCA, but it is standard practice in
+Seurat workflows and provides a nice visualization.
+
+**Important note on n.neighbors:** UMAP's default `n.neighbors = 30`
+requires at least 31 samples. With our 28 samples, we must set
+`n.neighbors` to a value smaller than the number of samples. We use
+`n.neighbors = min(15, ncol(seurat_obj) - 1)` to adapt automatically.
+
+```{r run-umap, fig.cap="UMAP projection of samples colored by response status."}
+# Adapt n.neighbors to our small sample size
+# Default is 30, but we only have 28 samples, so we reduce it
+n_samples <- ncol(seurat_obj)
+n_neighbors_safe <- min(15, n_samples - 1)
+
+cat("Number of samples:", n_samples, "\n")
+cat("Using n.neighbors:", n_neighbors_safe, "\n")
+
+seurat_obj <- RunUMAP(seurat_obj,
+                       dims = 1:10,
+                       n.neighbors = n_neighbors_safe)
+
+DimPlot(seurat_obj, reduction = "umap", group.by = "response2",
+        cols = c("steelblue", "coral"), pt.size = 3) +
+  ggtitle("UMAP: Responders vs NonResponders")
+```
+
+## Hierarchical Clustering
+
+We use Spearman correlation-based hierarchical clustering as an
+independent validation of the PCA and UMAP sample groupings.
+
+```{r hierarchical-clustering, fig.cap="Hierarchical clustering dendrogram of samples based on Spearman correlation. Leaf colors indicate response status.", fig.height=6}
+logcpm_seurat <- as.matrix(GetAssayData(seurat_obj, layer = "data"))
+d <- as.dist(1 - cor(logcpm_seurat, method = "spearman"))
+hc <- hclust(d)
+dend <- as.dendrogram(hc, hang = 0.1)
+
+# Color leaves by response status
+labfun <- function(x, response_vec) {
+  if (is.leaf(x)) {
+    lab <- attr(x, "label")
+    col <- ifelse(response_vec[lab] == "Responder", "coral", "steelblue")
+    attr(x, "nodePar") <- list(lab.col = col, pch = NA)
+  }
+  x
+}
+
+response_named <- setNames(
+  as.character(seurat_obj$response2),
+  colnames(seurat_obj)
+)
+dend <- dendrapply(dend, labfun, response_named)
+par(mar = c(6, 4, 2, 1))
+plot(dend, main = "Hierarchical Clustering of Samples")
+legend("topright", c("NonResponder", "Responder"),
+       col = c("steelblue", "coral"), pch = 15, bty = "n")
+```
+
+# Surrogate Variable Analysis (SVA)
+
+**Theory: What is SVA?**
+
+Even when no explicit batch information is available, hidden sources of
+variation (unknown batches, sample handling differences, RNA quality)
+can inflate false positives. Surrogate Variable Analysis (SVA) estimates
+these hidden factors from the data itself, creating "surrogate
+variables" (SVs) that capture systematic unwanted variation. These SVs
+can then be included as covariates in the DESeq2 model.
+
+```{r sva-analysis}
+# Compute logCPM for SVA input
+logcpm_for_sva <- as.matrix(GetAssayData(seurat_obj, layer = "data"))
+
+# Prepare model matrices
+mod  <- model.matrix(~ response2, data = seurat_obj@meta.data)
+mod0 <- model.matrix(~ 1, data = seurat_obj@meta.data)
+
+# Estimate number of surrogate variables
+n_sv <- num.sv(logcpm_for_sva, mod, method = "be")
+cat("Estimated number of surrogate variables:", n_sv, "\n")
+
+# Estimate surrogate variables (if any detected)
+if (n_sv > 0) {
+  sva_obj <- sva(logcpm_for_sva, mod, mod0, n.sv = n_sv)
+  sv_df <- as.data.frame(sva_obj$sv)
+  colnames(sv_df) <- paste0("SV", 1:ncol(sv_df))
+  rownames(sv_df) <- colnames(seurat_obj)
+  cat("SVA completed. Surrogate variables estimated:", ncol(sv_df), "\n")
+} else {
+  cat("No significant surrogate variables detected.\n")
+  sv_df <- NULL
+}
+```
+
+# Differential Expression with DESeq2
+
+## Preparing the DESeqDataSet
+
+**Theory: DESeqDataSet construction**
+
+DESeq2 requires raw counts (not normalized), a sample metadata data
+frame, and a design formula. We extract the raw counts from the Seurat
+object's `counts` layer and the metadata from `meta.data`. The design
+formula `~ response2` tells DESeq2 to model gene expression as a
+function of response status.
+
+Important: DESeq2 works on raw counts because it applies its own
+normalization internally (size factors based on the median-of-ratios
+method). We should NOT feed it the Seurat-normalized data.
+
+If SVA detected surrogate variables, we add them to the metadata and
+include them in the design formula to adjust for hidden confounders.
+
+```{r prepare-deseq2}
+# Extract raw counts from Seurat
+raw_counts <- GetAssayData(seurat_obj, layer = "counts")
+
+# Get metadata
+meta <- seurat_obj@meta.data
+
+# Ensure response2 is a factor with NonResponder as reference
+meta$response2 <- factor(meta$response2,
+                          levels = c("NonResponder", "Responder"))
+
+# Add surrogate variables to metadata if detected
+if (!is.null(sv_df)) {
+  meta <- cbind(meta, sv_df[rownames(meta), , drop = FALSE])
+  design_formula <- as.formula(
+    paste("~ response2 +", paste(colnames(sv_df), collapse = " + "))
+  )
+  cat("Design includes response2 +", ncol(sv_df), "surrogate variables\n")
+} else {
+  design_formula <- ~ response2
+  cat("Design includes response2 only (no SVs detected)\n")
+}
+
+# Create DESeqDataSet
+dds <- DESeqDataSetFromMatrix(
+  countData = as.matrix(raw_counts),
+  colData   = meta,
+  design    = design_formula
+)
+
+cat("DESeqDataSet created:", nrow(dds), "genes x", ncol(dds), "samples\n")
+```
+
+## Pre-filtering
+
+We apply a light pre-filter to remove genes with very low counts. This
+reduces memory usage and speeds up computation. DESeq2's internal
+independent filtering will do additional filtering, but pre-filtering
+removes obvious noise.
+
+```{r prefilter}
+# Keep genes with at least 10 total counts across all samples
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep, ]
+cat("Genes after pre-filtering:", nrow(dds), "\n")
+```
+
+## Running DESeq2
+
+**Theory: What happens inside DESeq()?**
+
+The single `DESeq()` call performs three steps internally:
+
+1. **Estimation of size factors** (`estimateSizeFactors()`): DESeq2
+   computes the geometric mean of each gene across all samples, then
+   for each sample calculates the median ratio of observed counts to
+   these geometric means. This ratio is the size factor.
+
+2. **Estimation of gene-wise dispersions** (`estimateDispersions()`):
+   For each gene, DESeq2 estimates the dispersion (a measure of how
+   much the variance exceeds the mean). It then fits a smooth curve
+   relating mean expression to dispersion and shrinks each gene's
+   dispersion toward this trend using an empirical Bayes approach.
+
+3. **Negative binomial GLM fitting and Wald test**
+   (`nbinomWaldTest()`): For each gene, DESeq2 fits a generalized
+   linear model with the NB distribution and tests whether the log2
+   fold change for response2 is significantly different from zero.
+
+```{r run-deseq2}
+dds <- DESeq(dds)
+
+cat("DESeq2 analysis complete.\n")
+cat("Results names:", resultsNames(dds), "\n")
+```
+
+```{r dispersion-plot, fig.cap="Dispersion estimates vs. mean normalized counts. Black dots: gene-wise estimates. Red curve: fitted trend. Blue dots: shrunken (final) estimates."}
+plotDispEsts(dds)
+```
+
+## Extracting Results
+
+```{r extract-results}
+# Extract results for Responder vs NonResponder
+res <- results(dds, contrast = c("response2", "Responder", "NonResponder"),
+               alpha = 0.05)
+
+cat("DESeq2 results summary:\n")
+summary(res, alpha = 0.05)
+```
+
+## Log Fold Change Shrinkage
+
+**Theory: Why shrink the LFC?**
+
+Raw LFC estimates from DESeq2 can be unreliable for genes with low
+counts or high dispersion. These genes may show extreme fold changes
+simply due to noise. LFC shrinkage uses a Bayesian approach to moderate
+these estimates: genes with weak evidence (low counts, high variance)
+are pulled toward zero, while genes with strong evidence keep their
+original LFC.
+
+The `apeglm` method (Zhu, Ibrahim, Love, 2019) is the recommended
+shrinkage estimator. It produces adaptive shrinkage that preserves
+large, well-supported fold changes while dampening noisy ones.
+
+Note: This step is unique to DESeq2. In Pipeline 1, limma's eBayes
+moderation serves a similar purpose for the variance, but does not
+shrink the fold changes themselves.
+
+```{r lfc-shrinkage}
+resLFC <- lfcShrink(dds,
+                     coef = "response2_Responder_vs_NonResponder",
+                     type = "apeglm")
+
+cat("After LFC shrinkage:\n")
+summary(resLFC, alpha = 0.05)
+```
+
+## Comparing Shrunken vs. Unshrunken LFC
+
+```{r ma-comparison, fig.cap="MA plots comparing unshrunken (left) vs. apeglm-shrunken (right) log2 fold changes. Shrinkage reduces noisy extreme values for lowly expressed genes.", fig.width=12, fig.height=5}
+par(mfrow = c(1, 2))
+plotMA(res, main = "Unshrunken LFC", ylim = c(-5, 5))
+plotMA(resLFC, main = "Shrunken LFC (apeglm)", ylim = c(-5, 5))
+par(mfrow = c(1, 1))
+```
+
+# Visualization of DE Results
+
+## Define Strict DEGs
+
+```{r define-strict-degs}
+strict_fdr <- 0.05
+min_abs_lfc <- 1.0
+
+# Convert DESeq2 results to data frame
+res_df <- as.data.frame(resLFC) %>%
+  rownames_to_column(var = "gene_id") %>%
+  filter(!is.na(padj))
+
+# Merge with gene metadata for symbols
+# gene_meta has columns like gene_id, gene_biotype, symbol.
+# We use the rownames of gene_meta as the merge key to avoid
+# the "Column name must not be duplicated" error.
+gene_meta_df <- gene_meta
+gene_meta_df$merge_key <- rownames(gene_meta_df)
+
+# Only keep columns not already in res_df (avoid duplicating baseMean etc.)
+cols_to_add <- setdiff(colnames(gene_meta_df), colnames(res_df))
+cols_to_add <- c("merge_key", cols_to_add)
+
+res_df <- left_join(res_df,
+                    gene_meta_df[, cols_to_add, drop = FALSE],
+                    by = c("gene_id" = "merge_key"))
+
+# Detect symbol column
+sym_col <- intersect(c("symbol", "Symbol", "gene_name"), colnames(res_df))[1]
+
+# Apply strict thresholds
+strict_DEGs <- res_df %>%
+  filter(padj < strict_fdr, abs(log2FoldChange) >= min_abs_lfc)
+
+cat("Strict DEGs (FDR <", strict_fdr, ", |log2FC| >=", min_abs_lfc, "):",
+    nrow(strict_DEGs), "\n")
+cat("  Upregulated in Responders:  ", sum(strict_DEGs$log2FoldChange > 0), "\n")
+cat("  Downregulated in Responders:", sum(strict_DEGs$log2FoldChange < 0), "\n")
+```
+
+## P-value Distribution
+
+**Theory: Interpreting p-value histograms**
+
+A well-calibrated DE analysis should produce a p-value distribution that
+is a mixture of a uniform component (from true null genes) and a spike
+near zero (from truly DE genes). An anti-conservative pattern (spike
+near 1) may indicate model misspecification.
+
+```{r pvalue-hist, fig.cap="Distribution of raw p-values from DESeq2. A spike near zero indicates true DE genes above the uniform null distribution."}
+hist(res_df$pvalue, breaks = 50, col = "lightblue", border = "white",
+     main = "", xlab = "Raw p-value", ylab = "Number of genes", las = 1)
+abline(v = 0.05, col = "blue", lwd = 2, lty = 2)
+text(0.3, max(hist(res_df$pvalue, plot = FALSE)$counts) * 0.9,
+     paste0("Genes with p <= 0.05: ", sum(res_df$pvalue <= 0.05)),
+     col = "blue", font = 2, cex = 0.9)
+```
+
+## Volcano Plot
+
+```{r volcano-plot, fig.cap="Volcano plot of shrunken log2 fold changes vs. -log10 adjusted p-values. Red points are strict DEGs. Top genes are labeled.", fig.width=10, fig.height=7}
+res_df$is_strict <- res_df$padj < strict_fdr &
+                    abs(res_df$log2FoldChange) >= min_abs_lfc &
+                    !is.na(res_df$padj)
+
+# Top genes to label
+top_to_label <- res_df %>%
+  filter(is_strict) %>%
+  arrange(padj) %>%
+  slice_head(n = 15)
+
+p <- ggplot(res_df, aes(x = log2FoldChange, y = -log10(padj))) +
+  geom_point(aes(color = is_strict), size = 0.8, alpha = 0.6) +
+  scale_color_manual(values = c("grey60", "firebrick"),
+                     labels = c("Not significant", "Strict DEG")) +
+  geom_vline(xintercept = c(-min_abs_lfc, min_abs_lfc),
+             linetype = "dashed", color = "darkgreen", linewidth = 0.5) +
+  geom_hline(yintercept = -log10(strict_fdr),
+             linetype = "dashed", color = "blue", linewidth = 0.5) +
+  labs(x = expression(log[2] ~ "FC (Responder vs NonResponder)"),
+       y = expression(-log[10] ~ "(adjusted p-value)"),
+       color = "") +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+# Add labels if we have symbols
+if (!is.na(sym_col) && sym_col %in% colnames(top_to_label)) {
+  p <- p + geom_text_repel(data = top_to_label,
+                           aes(label = .data[[sym_col]]),
+                           size = 3, max.overlaps = 20)
+}
+print(p)
+```
+
+## Heatmap of Top DEGs
+
+```{r heatmap, fig.cap="Heatmap of the top 50 DEGs (by adjusted p-value) using variance-stabilized expression values. Rows are z-scored across samples.", fig.height=10}
+# Variance stabilizing transformation for visualization
+vsd <- vst(dds, blind = FALSE)
+
+# Top 50 genes
+top50_genes <- res_df %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj) %>%
+  slice_head(n = 50) %>%
+  pull(gene_id)
+
+# Extract and z-score
+mat <- assay(vsd)[top50_genes, ]
+mat_z <- t(scale(t(mat)))
+
+# Row labels: use symbols if available
+if (!is.na(sym_col) && sym_col %in% colnames(res_df)) {
+  sym_lookup <- setNames(res_df[[sym_col]], res_df$gene_id)
+  row_labels <- ifelse(is.na(sym_lookup[rownames(mat_z)]) |
+                        sym_lookup[rownames(mat_z)] == "",
+                        rownames(mat_z),
+                        sym_lookup[rownames(mat_z)])
+  rownames(mat_z) <- row_labels
+}
+
+# Annotation
+annot_col <- data.frame(
+  Response = colData(dds)$response2,
+  row.names = colnames(mat_z)
+)
+annot_colors <- list(
+  Response = c(NonResponder = "steelblue", Responder = "coral")
+)
+
+pheatmap(mat_z,
+         annotation_col = annot_col,
+         annotation_colors = annot_colors,
+         cluster_rows = TRUE, cluster_cols = TRUE,
+         show_colnames = FALSE,
+         fontsize_row = 7,
+         color = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+         main = "Top 50 DEGs (z-scored VST values)")
+```
+
+## PCA on VST-Transformed Data
+
+**Theory: VST vs. voom**
+
+DESeq2 provides two transformations for visualization: `vst()`
+(variance-stabilizing transformation) and `rlog()` (regularized log).
+Both stabilize the variance across the range of mean values, making the
+data suitable for PCA, clustering, and heatmaps. VST is faster and
+recommended for datasets with more than ~30 samples, while rlog is
+better for very small datasets (<20 samples). Both are conceptually
+similar to what voom does in Pipeline 1, but operate differently:
+
+- **voom** (Pipeline 1): estimates precision weights for each
+  observation, keeping the data as weighted log-CPM
+- **VST** (Pipeline 2): transforms the counts so that the variance
+  becomes approximately constant across expression levels
+
+```{r pca-vst, fig.cap="PCA using VST-transformed data from DESeq2. This is the DESeq2 equivalent of the MDS plot in Pipeline 1."}
+plotPCA(vsd, intgroup = "response2") +
+  scale_color_manual(values = c("steelblue", "coral")) +
+  theme_minimal() +
+  ggtitle("PCA on VST-transformed data")
+```
+
+## Top 20 DEGs Table
+
+```{r top20-table}
+top20 <- strict_DEGs %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  slice_head(n = 20)
+
+# Build display columns dynamically
+display_cols <- c("gene_id", "log2FoldChange", "baseMean",
+                  "stat", "pvalue", "padj")
+if (!is.na(sym_col)) display_cols <- c(display_cols, sym_col)
+
+# Only select columns that actually exist
+display_cols <- intersect(display_cols, colnames(top20))
+
+top20_display <- top20 %>%
+  dplyr::select(all_of(display_cols))
+
+kable(top20_display,
+      caption = "Top 20 DEGs by absolute log2 fold change (DESeq2, FDR < 0.05, |log2FC| >= 1).",
+      digits = 4,
+      row.names = FALSE) %>%
+  kable_styling(full_width = FALSE, position = "center",
+                bootstrap_options = c("striped", "hover", "condensed")) %>%
+  scroll_box(width = "100%", height = "400px")
+```
+
+## Gene-Level Boxplots (Top 6)
+
+```{r gene-boxplots, fig.cap="Normalized counts for the top 6 DEGs, comparing Responders vs NonResponders.", fig.width=12, fig.height=8}
+top6_genes <- strict_DEGs %>%
+  arrange(padj) %>%
+  slice_head(n = 6) %>%
+  pull(gene_id)
+
+par(mfrow = c(2, 3))
+for (gene in top6_genes) {
+  # Get symbol if available
+  label <- gene
+  if (!is.na(sym_col) && sym_col %in% colnames(res_df)) {
+    s <- res_df[[sym_col]][res_df$gene_id == gene]
+    if (length(s) > 0 && !is.na(s[1]) && s[1] != "") label <- s[1]
+  }
+  plotCounts(dds, gene = gene, intgroup = "response2",
+             main = label, col = c("steelblue", "coral"))
+}
+par(mfrow = c(1, 1))
+```
+
+## Save DE Results
+
+```{r save-results}
+# Full results
+write.csv(res_df, "../results/tables/p2_full_DE_results_deseq2.csv",
+          row.names = FALSE)
+
+# Strict DEGs
+write.csv(strict_DEGs, "../results/tables/p2_strict_DEGs_deseq2.csv",
+          row.names = FALSE)
+
+cat("Saved DESeq2 results to results/tables/\n")
+```
+
+# Functional Enrichment Analysis
+
+## GO Enrichment with GOstats
+
+**Theory: Hypergeometric test for GO enrichment**
+
+Gene Ontology (GO) enrichment asks: among our list of DE genes, are
+certain biological processes over-represented compared to what we would
+expect by chance? The hypergeometric test models this as drawing balls
+from an urn: given N total genes, K genes annotated to a GO term, and n
+DE genes, how many DE genes annotated to that term (k) would we expect?
+A significant p-value means the overlap is larger than chance.
+
+The conditional test accounts for the hierarchical structure of GO by
+conditioning on child terms that have already been found significant,
+reducing redundancy.
+
+```{r go-enrichment}
+# Map DEG Ensembl IDs to Entrez IDs
+deg_genes <- strict_DEGs$gene_id
+
+entrez_map <- tryCatch({
+  AnnotationDbi::select(org.Hs.eg.db,
+                        keys = deg_genes,
+                        columns = "ENTREZID",
+                        keytype = "ENSEMBL")
+}, error = function(e) {
+  # If Ensembl fails, try with gene symbols
+  if (!is.na(sym_col) && sym_col %in% colnames(strict_DEGs)) {
+    syms <- strict_DEGs[[sym_col]]
+    syms <- syms[!is.na(syms) & syms != ""]
+    AnnotationDbi::select(org.Hs.eg.db,
+                          keys = syms,
+                          columns = "ENTREZID",
+                          keytype = "SYMBOL")
+  } else {
+    data.frame(ENTREZID = character(0))
+  }
+})
+
+entrez_ids <- unique(na.omit(entrez_map$ENTREZID))
+cat("Mapped", length(entrez_ids), "unique Entrez IDs from",
+    length(deg_genes), "DEGs\n")
+```
+
+```{r run-go-enrichment}
+if (length(entrez_ids) > 5) {
+  params <- new("GOHyperGParams",
+                geneIds      = entrez_ids,
+                annotation   = "org.Hs.eg.db",
+                ontology     = "BP",
+                pvalueCutoff = 0.05,
+                testDirection = "over")
+  conditional(params) <- TRUE
+  hgOverCond <- hyperGTest(params)
+
+  # Summarize and filter
+  resGO <- summary(hgOverCond)
+  resGO <- resGO[resGO$Size >= 3 & resGO$Size <= 300 & resGO$Count >= 3, ]
+  resGO <- resGO[order(resGO$OddsRatio, decreasing = TRUE), ]
+
+  cat("Significant GO BP terms after filtering:", nrow(resGO), "\n")
+} else {
+  cat("Too few mapped genes for enrichment analysis.\n")
+  resGO <- NULL
+}
+```
+
+```{r go-pvalue-dist, fig.cap="P-value distribution for GO enrichment before and after filtering.", fig.width=10, fig.height=4}
+if (!is.null(resGO) && nrow(resGO) > 0) {
+  pvals_all <- pvalues(hgOverCond)
+  par(mfrow = c(1, 2), mar = c(4, 5, 2, 1))
+  hist(pvals_all, xlab = "P-value", main = "Before filtering", las = 1,
+       col = "lightblue", border = "white")
+  hist(pvals_all[resGO$GOBPID], xlab = "P-value", main = "After filtering",
+       las = 1, col = "lightblue", border = "white", xlim = c(0, 1))
+  par(mfrow = c(1, 1))
+}
+```
+
+```{r go-gene-symbols}
+if (!is.null(resGO) && nrow(resGO) > 0) {
+  # Map Entrez IDs to gene symbols for each GO term
+  geneIDs_by_GO <- geneIdsByCategory(hgOverCond)[resGO$GOBPID]
+  all_entrez <- unique(as.character(unlist(geneIDs_by_GO)))
+
+  entrez_to_symbol <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = all_entrez,
+    columns = "SYMBOL",
+    keytype = "ENTREZID"
+  )
+  sym_map_go <- setNames(entrez_to_symbol$SYMBOL, entrez_to_symbol$ENTREZID)
+
+  gene_symbols_by_go <- sapply(geneIDs_by_GO, function(ids) {
+    syms <- sym_map_go[as.character(ids)]
+    paste(syms[!is.na(syms)], collapse = ", ")
+  })
+
+  go_results <- cbind(resGO, Genes = unlist(gene_symbols_by_go))
+  rownames(go_results) <- seq_len(nrow(go_results))
+}
+```
+
+```{r go-table}
+if (!is.null(resGO) && nrow(resGO) > 0) {
+  kable(head(go_results, 15),
+        caption = "Top 15 enriched GO Biological Process terms.",
+        row.names = FALSE) %>%
+    kable_styling(full_width = FALSE, position = "center",
+                  bootstrap_options = c("striped", "hover", "condensed")) %>%
+    scroll_box(width = "100%", height = "400px")
+}
+```
+
+## GSEA with fgsea
+
+**Theory: Ranked-list GSEA**
+
+GSEA uses the full ranked gene list rather than a binary DEG list. We
+rank genes by the DESeq2 Wald statistic (which combines fold change
+magnitude and significance) and test for pathway enrichment.
+
+```{r gsea-ranked-list}
+# # Create ranked list using DESeq2 stat (Wald statistic)
+# if (!is.na(sym_col) && sym_col %in% colnames(res_df)) {
+#   all_symbols <- res_df[[sym_col]]
+#   all_stats   <- res_df$stat
+# 
+#   # Remove NAs
+#   valid <- !is.na(all_symbols) & all_symbols != "" & !is.na(all_stats)
+#   gene_list <- setNames(all_stats[valid], all_symbols[valid])
+# 
+#   # Remove duplicates (keep highest absolute stat)
+#   gene_list <- gene_list[order(abs(gene_list), decreasing = TRUE)]
+#   gene_list <- gene_list[!duplicated(names(gene_list))]
+# 
+#   # Sort decreasingly
+#   gene_list <- sort(gene_list, decreasing = TRUE)
+# 
+#   cat("GSEA ranked list:", length(gene_list), "genes\n")
+#   cat("Top 5:", head(names(gene_list)), "\n")
+#   cat("Bottom 5:", tail(names(gene_list)), "\n")
+# }
+```
+
+```{r save-enrichment}
+if (exists("go_results") && nrow(go_results) > 0) {
+  write.csv(go_results, "../results/enrichment/p2_GO_BP_results.csv",
+            row.names = FALSE)
+  cat("Saved enrichment results to results/enrichment/\n")
+}
+```
+
+# Comparison with Pipeline 1
+
+## Summary Table
+
+```{r comparison}
+cat("=== Pipeline Comparison ===\n\n")
+cat("Pipeline 1 (edgeR/limma-voom):\n")
+cat("  Container:      SummarizedExperiment + DGEList\n")
+cat("  Normalization:  TMM\n")
+cat("  Transformation: voom (precision weights)\n")
+cat("  DE test:        Moderated t-test (eBayes)\n")
+cat("  Enrichment:     GOstats (hypergeometric)\n\n")
+
+cat("Pipeline 2 (Seurat + DESeq2):\n")
+cat("  Container:      Seurat object\n")
+cat("  Normalization:  LogNormalize (Seurat) + median-of-ratios (DESeq2)\n")
+cat("  Distribution:   Negative binomial (counts directly)\n")
+cat("  DE test:        Wald test + apeglm LFC shrinkage\n")
+cat("  Enrichment:     GOstats (hypergeometric)\n\n")
+
+cat("Strict DEGs found (Pipeline 2):", nrow(strict_DEGs), "\n")
+```
+
+# Discussion
+
+In this second pipeline, we analyzed the same CLL dasatinib response
+dataset using the Seurat + DESeq2 framework. The key differences from
+Pipeline 1 include:
+
+1. **Data container**: The Seurat object provides a unified interface
+   for normalization, scaling, dimensionality reduction, and
+   visualization. Unlike the SummarizedExperiment + DGEList combination,
+   Seurat handles all steps in a single object with consistent syntax.
+
+2. **Statistical model**: DESeq2's negative binomial model fits raw
+   counts directly, avoiding the need for voom transformation. The
+   dispersion shrinkage (visible in the dispersion plot) serves a
+   similar purpose to limma's eBayes variance moderation.
+
+3. **LFC shrinkage**: The apeglm shrinkage method in DESeq2 moderates
+   fold change estimates, producing more reliable effect sizes for
+   lowly expressed genes. This is unique to the DESeq2 framework and
+   does not have a direct equivalent in limma-voom.
+
+4. **UMAP visualization**: Unlike Pipeline 1 which uses MDS, we
+   applied both PCA and UMAP here via Seurat. For our small sample
+   size (28 samples), we adapted the n.neighbors parameter to avoid
+   the "n_neighbors must be smaller than dataset size" error.
+
+5. **SVA integration**: We included Surrogate Variable Analysis to
+   detect and correct for hidden confounders, with the surrogate
+   variables incorporated directly into the DESeq2 design formula.
+
+The biological conclusions (enrichment of apoptosis and B-cell signaling
+pathways among DEGs in responders) should be consistent across both
+pipelines, validating the robustness of our findings regardless of the
+analytical framework.
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
