@@ -1,0 +1,760 @@
+---
+title: "FASTQ to Count Matrix: Complete Salmon Pipeline"
+subtitle: "From raw paired-end reads to a gene-level count matrix in R"
+author: "Samuel Escudero"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Overview
+
+This guide walks through every step of processing 14 paired-end bulk
+RNA-seq samples using **Salmon** for pseudo-alignment and
+quantification, followed by **tximeta** in R to import transcript-level
+abundances and summarize them to gene-level counts. We produce a
+`SummarizedExperiment` object saved as `.rds` for reuse in downstream
+pipelines (edgeR, DESeq2, Seurat, etc.).
+
+**What we cover:**
+
+1. Compressing and transferring FASTQ files to the cluster
+2. Installing Salmon and FastQC on the cluster
+3. Downloading the GRCh38 reference transcriptome and genome
+4. Building the Salmon index (with decoy sequences)
+5. Quality control with FastQC + MultiQC
+6. Quantifying all 14 samples with Salmon (loop)
+7. Importing into R with tximeta
+8. Summarizing to gene level
+9. Saving as RDS for downstream analysis
+
+**Approximate total time:** 2-3 hours for 14 samples (depending on
+cluster speed and queue times).
+
+# Step 0: Prepare and Transfer FASTQ Files
+
+## On your local computer (BASH)
+
+First, we compress our FASTQ files (if they are not already .gz) and
+transfer them to the cluster.
+
+```bash
+# ============================================================
+# RUN THIS ON YOUR LOCAL MACHINE (laptop/desktop)
+# ============================================================
+
+# Check your FASTQ files
+# They should be named like: sample1_R1.fastq, sample1_R2.fastq
+# or already compressed: sample1_R1.fastq.gz
+ls raw_data/
+# Expected: 28 files (14 samples x 2 reads each: R1 and R2)
+
+# If your files are NOT compressed (.fastq without .gz), compress them
+# This saves ~70% disk space and is required for transfer
+# Time: ~2-5 min per file depending on size
+cd raw_data/
+for f in *.fastq; do
+    echo "Compressing ${f}..."
+    gzip "${f}"
+done
+
+# Verify all files are compressed
+ls *.fastq.gz | wc -l
+# Should show 28
+
+# Create a tar archive of all compressed FASTQs for faster transfer
+# Time: ~1-2 min
+cd ..
+tar -cf fastq_archive.tar raw_data/*.fastq.gz
+echo "Archive created: $(du -h fastq_archive.tar | cut -f1)"
+```
+
+## Transfer to the cluster (BASH - local machine)
+
+```bash
+# ============================================================
+# RUN THIS ON YOUR LOCAL MACHINE
+# Transfer the archive to the cluster via scp
+# Replace <username> and <cluster_address> with your details
+# Time: depends on network speed, typically 10-30 min for ~50 GB
+# ============================================================
+
+scp fastq_archive.tar <username>@<cluster_address>:~/projects/rnaseq_project/
+
+# Alternative: if you prefer rsync (can resume interrupted transfers)
+# rsync -avP fastq_archive.tar <username>@<cluster_address>:~/projects/rnaseq_project/
+```
+
+## On the cluster: unpack the archive (BASH)
+
+```bash
+# ============================================================
+# RUN THIS ON THE CLUSTER (after ssh login)
+# ============================================================
+
+# Connect to the cluster
+ssh <username>@<cluster_address>
+
+# Navigate to your project directory
+mkdir -p ~/projects/rnaseq_project
+cd ~/projects/rnaseq_project
+
+# Create the directory structure
+mkdir -p raw_data
+mkdir -p reference
+mkdir -p salmon_index
+mkdir -p salmon_quant
+mkdir -p qc_results
+mkdir -p results
+
+# Extract the archive
+# Time: ~1-2 min
+tar -xf fastq_archive.tar
+# If files extracted into a subdirectory, move them:
+# mv raw_data/*.fastq.gz ./raw_data/
+
+# Verify
+ls raw_data/*.fastq.gz | wc -l
+# Should show 28 files (14 samples x 2 reads)
+
+# Check the sample names
+ls raw_data/*_R1.fastq.gz | sed 's/_R1.fastq.gz//' | sed 's|raw_data/||'
+# This prints your 14 sample names
+```
+
+# Step 1: Install Tools on the Cluster
+
+## Load or install Salmon and FastQC (BASH - cluster)
+
+Most HPC clusters have these available via module systems. Check first:
+
+```bash
+# ============================================================
+# RUN ON THE CLUSTER
+# ============================================================
+
+# Option A: Load pre-installed modules (most common on HPC)
+module avail salmon
+module avail fastqc
+module avail multiqc
+
+# If available, load them:
+module load salmon/1.10.0    # or whatever version is available
+module load fastqc/0.12.1
+module load multiqc/1.14
+
+# Verify
+salmon -v
+fastqc -v
+
+# Option B: If not available via modules, install with conda
+# First, make sure conda/miniconda is available
+module load miniconda3   # or anaconda3
+
+# Create a dedicated environment
+conda create -n rnaseq_env -c bioconda -c conda-forge \
+    salmon=1.10 fastqc multiqc
+
+conda activate rnaseq_env
+
+# Verify installation
+salmon -v
+# Expected output: salmon 1.10.x
+fastqc -v
+# Expected output: FastQC v0.12.x
+```
+
+# Step 2: Download the GRCh38 Reference
+
+## Download transcriptome and genome from ENSEMBL (BASH - cluster)
+
+Salmon needs the transcriptome FASTA (cDNA sequences) for
+pseudo-alignment. For best results, we also download the genome FASTA
+to use as decoy sequences. Decoys prevent spurious mappings of reads
+that originate from intergenic or intronic regions.
+
+```bash
+# ============================================================
+# RUN ON THE CLUSTER
+# Time: ~10-20 min depending on download speed
+# ============================================================
+
+cd ~/projects/rnaseq_project/reference
+
+# Download the human transcriptome (cDNA) from ENSEMBL release 109
+# This is the set of all known mRNA transcript sequences
+# Size: ~300 MB compressed
+wget -O Homo_sapiens.GRCh38.cdna.all.fa.gz \
+    https://ftp.ensembl.org/pub/release-109/fasta/homo_sapiens/cdna/Homo_sapiens.GRCh38.cdna.all.fa.gz
+
+# Download the primary genome assembly (for decoy sequences)
+# Size: ~900 MB compressed
+wget -O Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz \
+    https://ftp.ensembl.org/pub/release-109/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+
+# Download the GTF annotation file (needed later for tximeta in R)
+# Size: ~50 MB compressed
+wget -O Homo_sapiens.GRCh38.109.gtf.gz \
+    https://ftp.ensembl.org/pub/release-109/gtf/homo_sapiens/Homo_sapiens.GRCh38.109.gtf.gz
+
+# Decompress the GTF (we need it uncompressed later)
+gunzip Homo_sapiens.GRCh38.109.gtf.gz
+
+# Verify downloads
+ls -lh reference/
+# Expected:
+# Homo_sapiens.GRCh38.cdna.all.fa.gz        (~300 MB)
+# Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz (~900 MB)
+# Homo_sapiens.GRCh38.109.gtf               (~1.4 GB uncompressed)
+```
+
+## Prepare decoy sequences (BASH - cluster)
+
+Salmon's decoy-aware mode improves quantification accuracy. We create
+a "gentrome" file (transcriptome + genome concatenated) and a list of
+decoy chromosome names.
+
+```bash
+# ============================================================
+# RUN ON THE CLUSTER
+# Time: ~5-10 min
+# ============================================================
+
+cd ~/projects/rnaseq_project/reference
+
+# Extract chromosome names from the genome as decoy names
+# These tell Salmon which sequences are decoys (genomic, not transcripts)
+grep "^>" <(gunzip -c Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz) \
+    | cut -d " " -f 1 | sed 's/>//' > decoys.txt
+
+# Check: should list chromosome names (1, 2, 3, ..., X, Y, MT, etc.)
+head decoys.txt
+wc -l decoys.txt
+# Expected: ~190-640 entries (chromosomes + scaffolds)
+
+# Create the gentrome: concatenate transcriptome + genome
+# IMPORTANT: transcriptome MUST come first
+cat Homo_sapiens.GRCh38.cdna.all.fa.gz \
+    Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz \
+    > gentrome.fa.gz
+
+echo "Gentrome created: $(du -h gentrome.fa.gz | cut -f1)"
+```
+
+# Step 3: Build the Salmon Index
+
+```bash
+# ============================================================
+# RUN ON THE CLUSTER
+# Time: ~20-40 min, requires ~16 GB RAM
+# Submit as a job if your cluster requires it (see SLURM example below)
+# ============================================================
+
+cd ~/projects/rnaseq_project
+
+# Build the decoy-aware Salmon index
+# -t: input FASTA (gentrome = transcriptome + genome)
+# -d: decoy sequences file
+# -i: output index directory
+# -p: number of threads
+salmon index \
+    -t reference/gentrome.fa.gz \
+    -d reference/decoys.txt \
+    -i salmon_index \
+    -p 8
+
+# Verify the index was created
+ls salmon_index/
+# Expected: several files including info.json, pos.bin, etc.
+
+echo "Salmon index complete."
+```
+
+**SLURM job script** (if your cluster uses SLURM):
+
+```bash
+#!/bin/bash
+#SBATCH -J salmon_index
+#SBATCH -o salmon_index_%j.out
+#SBATCH -e salmon_index_%j.err
+#SBATCH -p normal
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -t 02:00:00
+#SBATCH -A your_allocation
+
+module load salmon/1.10.0
+
+cd ~/projects/rnaseq_project
+
+salmon index \
+    -t reference/gentrome.fa.gz \
+    -d reference/decoys.txt \
+    -i salmon_index \
+    -p 8
+```
+
+Save this as `scripts/01_salmon_index.sh` and submit with `sbatch scripts/01_salmon_index.sh`.
+
+# Step 4: Quality Control with FastQC + MultiQC
+
+```bash
+# ============================================================
+# RUN ON THE CLUSTER
+# Time: ~15-30 min for 28 files (14 samples x 2 reads)
+# ============================================================
+
+cd ~/projects/rnaseq_project
+
+# Run FastQC on all FASTQ files
+# -o: output directory
+# -t: number of threads
+fastqc -o qc_results/ -t 8 raw_data/*.fastq.gz
+
+# Aggregate all FastQC reports into a single MultiQC report
+multiqc qc_results/ -o qc_results/multiqc_report
+
+# The HTML report is at:
+# qc_results/multiqc_report/multiqc_report.html
+# Download this to your local machine to view in a browser:
+# scp <user>@<cluster>:~/projects/rnaseq_project/qc_results/multiqc_report/multiqc_report.html .
+
+echo "QC complete. Review the MultiQC report before proceeding."
+```
+
+**What to look for in the MultiQC report:**
+
+- Per-base sequence quality: should be >28 across all positions
+- Adapter content: should be minimal (<5%). If high, trim with fastp
+- GC content: should follow a normal distribution
+- Sequence duplication: moderate duplication is normal for RNA-seq
+- Overrepresented sequences: check for adapter contamination
+
+If you need to trim adapters (only if MultiQC shows problems):
+
+```bash
+# Optional: trim adapters with fastp (only if needed)
+# Time: ~2-3 min per sample
+for sample in $(ls raw_data/*_R1.fastq.gz | sed 's/_R1.fastq.gz//' | sed 's|raw_data/||'); do
+    fastp \
+        -i raw_data/${sample}_R1.fastq.gz \
+        -I raw_data/${sample}_R2.fastq.gz \
+        -o trimmed/${sample}_R1_trimmed.fastq.gz \
+        -O trimmed/${sample}_R2_trimmed.fastq.gz \
+        -h qc_results/${sample}_fastp.html \
+        -w 4
+done
+# If trimming was done, use trimmed/ files for salmon quant below
+```
+
+# Step 5: Quantify All 14 Samples with Salmon
+
+This is the core step. Salmon performs pseudo-alignment and
+quantification in a single pass, producing per-sample directories with
+transcript-level counts, TPM values, and effective lengths.
+
+```bash
+# ============================================================
+# RUN ON THE CLUSTER
+# Time: ~3-8 min per sample, ~45-120 min total for 14 samples
+# ============================================================
+
+cd ~/projects/rnaseq_project
+
+# Create a list of sample names from the R1 files
+# Adjust the pattern to match YOUR file naming convention
+SAMPLES=$(ls raw_data/*_R1.fastq.gz | sed 's/_R1.fastq.gz//' | sed 's|raw_data/||')
+
+echo "Samples to process:"
+echo "${SAMPLES}"
+echo "Total: $(echo "${SAMPLES}" | wc -w) samples"
+
+# Loop through all samples and quantify
+for sample in ${SAMPLES}; do
+    echo "==========================================="
+    echo "Processing: ${sample}"
+    echo "Start time: $(date)"
+    echo "==========================================="
+
+    salmon quant \
+        -i salmon_index \
+        -l A \
+        -1 raw_data/${sample}_R1.fastq.gz \
+        -2 raw_data/${sample}_R2.fastq.gz \
+        -p 8 \
+        -o salmon_quant/${sample} \
+        -g reference/Homo_sapiens.GRCh38.109.gtf \
+        -validateMappings
+
+    echo "Finished: ${sample} at $(date)"
+    echo ""
+done
+
+echo "All samples quantified."
+```
+
+**SLURM array job** (recommended for parallel processing):
+
+```bash
+#!/bin/bash
+#SBATCH -J salmon_quant
+#SBATCH -o salmon_quant_%A_%a.out
+#SBATCH -e salmon_quant_%A_%a.err
+#SBATCH -p normal
+#SBATCH -N 1
+#SBATCH -n 8
+#SBATCH -t 01:00:00
+#SBATCH -A your_allocation
+#SBATCH -a 1-14
+
+module load salmon/1.10.0
+
+cd ~/projects/rnaseq_project
+
+# Get the sample name for this array task
+SAMPLE=$(ls raw_data/*_R1.fastq.gz | sed 's/_R1.fastq.gz//' | sed 's|raw_data/||' | sed -n "${SLURM_ARRAY_TASK_ID}p")
+
+echo "Processing sample ${SLURM_ARRAY_TASK_ID}: ${SAMPLE}"
+
+salmon quant \
+    -i salmon_index \
+    -l A \
+    -1 raw_data/${SAMPLE}_R1.fastq.gz \
+    -2 raw_data/${SAMPLE}_R2.fastq.gz \
+    -p 8 \
+    -o salmon_quant/${SAMPLE} \
+    -g reference/Homo_sapiens.GRCh38.109.gtf \
+    -validateMappings
+```
+
+Save as `scripts/02_salmon_quant_array.sh` and submit:
+`sbatch scripts/02_salmon_quant_array.sh`
+This runs all 14 samples in parallel (total time: ~8 min if slots are
+available).
+
+## Verify Salmon output
+
+```bash
+# ============================================================
+# RUN ON THE CLUSTER
+# ============================================================
+
+# Check that all 14 samples have quant.sf files
+ls salmon_quant/*/quant.sf | wc -l
+# Expected: 14
+
+# Check mapping rates
+for d in salmon_quant/*/; do
+    sample=$(basename ${d})
+    rate=$(grep "Mapping rate" ${d}/aux_info/meta_info.json 2>/dev/null || echo "N/A")
+    echo "${sample}: ${rate}"
+done
+
+# Quick look at a quant.sf file
+head salmon_quant/$(ls salmon_quant/ | head -1)/quant.sf
+# Columns: Name, Length, EffectiveLength, TPM, NumReads
+```
+
+# Step 6: Import into R with tximeta
+
+**Now we switch to R.** Everything below runs in R (RStudio or
+an R script on the cluster).
+
+## Create the sample table
+
+```{r import-setup}
+# ============================================================
+# RUN IN R (RStudio or R on the cluster)
+# ============================================================
+
+# Install packages if needed (run once)
+if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+BiocManager::install(c("tximeta", "SummarizedExperiment", "DESeq2"))
+
+library(tximeta)
+library(SummarizedExperiment)
+
+# Define the project directory
+project_dir <- "~/projects/rnaseq_project"
+
+# Build the sample table
+# List all quant.sf files
+quant_files <- list.files(
+  file.path(project_dir, "salmon_quant"),
+  pattern = "quant.sf",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+# Extract sample names from directory names
+sample_names <- basename(dirname(quant_files))
+
+cat("Found", length(quant_files), "quantification files:\n")
+print(sample_names)
+
+# Create the coldata data frame that tximeta requires
+# IMPORTANT: adjust the "condition" column to match YOUR experiment
+# Here we show a generic example with two groups
+coldata <- data.frame(
+  names     = sample_names,
+  files     = quant_files,
+  condition = factor(c(
+    # REPLACE THIS with your actual group assignments
+    # Example for 14 samples: 7 control + 7 treatment
+    rep("Control", 7),
+    rep("Treatment", 7)
+  )),
+  stringsAsFactors = FALSE
+)
+
+# Verify
+print(coldata)
+```
+
+## Import with tximeta
+
+**Theory: What does tximeta do?**
+
+`tximeta` is an enhanced version of `tximport` that automatically
+detects which reference transcriptome was used for quantification
+(by checking Salmon's metadata) and links it to the correct gene
+annotations. This means we get gene IDs, gene names, and genomic
+coordinates automatically, without having to manually provide a
+tx2gene mapping file.
+
+If tximeta cannot auto-detect the reference, we can provide the
+annotation manually using `makeLinkedTxome()`.
+
+```{r run-tximeta}
+# ============================================================
+# RUN IN R
+# Time: ~1-3 min
+# ============================================================
+
+# Import transcript-level quantifications
+# tximeta auto-detects the reference and downloads annotation
+se <- tximeta(coldata)
+
+cat("Transcript-level SummarizedExperiment created:\n")
+se
+```
+
+```{r manual-txome, eval=FALSE}
+# If tximeta auto-detection fails, create a linked transcriptome manually:
+# This tells tximeta exactly which reference was used
+
+gtf_path <- file.path(project_dir, "reference", "Homo_sapiens.GRCh38.109.gtf")
+fasta_path <- file.path(project_dir, "reference", "Homo_sapiens.GRCh38.cdna.all.fa.gz")
+index_dir <- file.path(project_dir, "salmon_index")
+
+makeLinkedTxome(
+  indexDir   = index_dir,
+  source     = "Ensembl",
+  organism   = "Homo sapiens",
+  release    = "109",
+  genome     = "GRCh38",
+  fasta      = fasta_path,
+  gtf        = gtf_path,
+  write      = FALSE
+)
+
+# Then re-run tximeta
+se <- tximeta(coldata)
+```
+
+## Summarize to gene level
+
+```{r summarize-genes}
+# ============================================================
+# RUN IN R
+# Time: ~30 sec
+# ============================================================
+
+# Summarize transcript-level counts to gene-level counts
+# This sums all transcript counts belonging to the same gene
+gse <- summarizeToGene(se)
+
+cat("Gene-level SummarizedExperiment:\n")
+gse
+
+cat("\nDimensions:", nrow(gse), "genes x", ncol(gse), "samples\n")
+cat("\nAssays available:", names(assays(gse)), "\n")
+cat("  - counts: raw counts (for DESeq2/edgeR)\n")
+cat("  - abundance: TPM values\n")
+cat("  - length: effective gene lengths\n")
+
+cat("\nSample metadata:\n")
+print(colData(gse))
+
+cat("\nFirst 5 genes:\n")
+head(rowData(gse), 5)
+```
+
+## Inspect the count matrix
+
+```{r inspect-counts}
+# ============================================================
+# RUN IN R
+# ============================================================
+
+# Look at the count matrix
+counts_matrix <- assay(gse, "counts")
+cat("Count matrix dimensions:", dim(counts_matrix), "\n")
+cat("Total genes:", nrow(counts_matrix), "\n")
+cat("Total samples:", ncol(counts_matrix), "\n\n")
+
+# Library sizes (total counts per sample)
+lib_sizes <- colSums(counts_matrix)
+cat("Library sizes (millions of reads):\n")
+print(round(lib_sizes / 1e6, 2))
+
+# Detected genes per sample (count > 0)
+detected <- colSums(counts_matrix > 0)
+cat("\nDetected genes per sample:\n")
+print(detected)
+
+# Quick summary of the count distribution
+cat("\nCount matrix summary (first 3 samples):\n")
+print(summary(counts_matrix[, 1:3]))
+```
+
+# Step 7: Save as RDS
+
+## Save the SummarizedExperiment object
+
+```{r save-rds}
+# ============================================================
+# RUN IN R
+# Time: ~10-30 sec
+# ============================================================
+
+# Save the gene-level SummarizedExperiment as an RDS file
+# This preserves the entire object: counts, metadata, gene annotations
+output_path <- file.path(project_dir, "results", "gene_counts_se.rds")
+saveRDS(gse, file = output_path)
+
+cat("SummarizedExperiment saved to:", output_path, "\n")
+cat("File size:", round(file.size(output_path) / 1e6, 1), "MB\n")
+
+# Also save just the count matrix as CSV (for use in Python/other tools)
+write.csv(
+  as.data.frame(counts_matrix),
+  file.path(project_dir, "results", "gene_counts_matrix.csv"),
+  row.names = TRUE
+)
+
+# Save sample metadata
+write.csv(
+  as.data.frame(colData(gse)),
+  file.path(project_dir, "results", "sample_metadata.csv"),
+  row.names = TRUE
+)
+
+cat("CSV files saved to results/\n")
+```
+
+## How to load the RDS later
+
+```{r load-rds}
+# ============================================================
+# RUN IN R (every time you start a new analysis session)
+# ============================================================
+
+library(SummarizedExperiment)
+
+# Load the saved object
+gse <- readRDS("~/projects/rnaseq_project/results/gene_counts_se.rds")
+
+# Verify it loaded correctly
+cat("Loaded:", class(gse), "\n")
+cat("Dimensions:", nrow(gse), "genes x", ncol(gse), "samples\n")
+cat("Assays:", names(assays(gse)), "\n")
+
+# Access the count matrix
+counts_matrix <- assay(gse, "counts")
+
+# Access sample metadata
+sample_info <- colData(gse)
+
+# Access gene annotations
+gene_info <- rowData(gse)
+
+# Now you can proceed with DESeq2, edgeR, or Seurat
+# Example: create a DESeqDataSet
+library(DESeq2)
+dds <- DESeqDataSet(gse, design = ~ condition)
+```
+
+# Step 8: Quick Sanity Check
+
+```{r sanity-check}
+# ============================================================
+# RUN IN R
+# Quick checks before downstream analysis
+# ============================================================
+
+library(ggplot2)
+
+# 1. Library size barplot
+lib_df <- data.frame(
+  sample = colnames(gse),
+  lib_size = colSums(assay(gse, "counts")) / 1e6,
+  condition = colData(gse)$condition
+)
+
+ggplot(lib_df, aes(x = reorder(sample, lib_size), y = lib_size, fill = condition)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "Sample", y = "Library size (millions)", fill = "Condition") +
+  theme_minimal()
+
+# 2. Gene detection rate
+cat("\nGenes with > 0 counts in all samples:",
+    sum(rowSums(assay(gse, "counts") > 0) == ncol(gse)), "\n")
+cat("Genes with > 10 counts total:",
+    sum(rowSums(assay(gse, "counts")) > 10), "\n")
+```
+
+# Summary of Steps and Times
+
+| Step | Tool | Where | Approx. Time |
+|------|------|-------|-------------|
+| 0. Compress FASTQs | gzip | Local | 2-5 min/file |
+| 0. Transfer to cluster | scp/rsync | Local | 10-30 min |
+| 0. Unpack archive | tar | Cluster (bash) | 1-2 min |
+| 1. Install tools | module/conda | Cluster (bash) | 5 min |
+| 2. Download references | wget | Cluster (bash) | 10-20 min |
+| 2. Prepare decoys | grep/cat | Cluster (bash) | 5-10 min |
+| 3. Build Salmon index | salmon index | Cluster (bash) | 20-40 min |
+| 4. FastQC + MultiQC | fastqc/multiqc | Cluster (bash) | 15-30 min |
+| 5. Salmon quant (x14) | salmon quant | Cluster (bash) | 3-8 min/sample |
+| 6. Import to R | tximeta | R (cluster or local) | 1-3 min |
+| 6. Summarize to gene | summarizeToGene | R | 30 sec |
+| 7. Save RDS | saveRDS | R | 10-30 sec |
+
+**Total: approximately 2-3 hours** (or ~30 min if Salmon quant is
+parallelized with SLURM array jobs).
+
+# References
+
+- Patro R et al. (2017). Salmon provides fast and bias-aware
+  quantification of transcript expression. Nature Methods 14:417-419.
+- Love MI et al. (2020). tximeta: Reference sequence checksums for
+  provenance identification in RNA-seq. PLOS Computational Biology.
+- Soneson C et al. (2015). Differential analyses for RNA-seq:
+  transcript-level estimates improve gene-level inferences. F1000Research.
+
+# Session Information
+
+```{r session-info, eval=TRUE}
+sessionInfo()
+```
